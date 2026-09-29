@@ -27,7 +27,10 @@ go run ./cmd/jobqueue worker   # worker pool
 | GET | `/jobs?status=pending&limit=50` | List job (limit 1..1000, default 100) |
 | GET | `/healthz` | 200 `ok` |
 
-Tipe job bawaan: `echo`, `sleep` (payload `{"ms":100}`).
+Tipe job bawaan:
+- `echo` — log payload.
+- `sleep` — tidur sesuai `{"ms":100}`.
+- `resize` — ukur ulang gambar. Payload `{"src":"path/atau/url","widths":[320,640],"format":"jpeg|png","outdir":"out"}` (`format` kosong = ikut sumber; gif → jpeg). Batas: 20 MiB, 100 megapiksel, maks 10 width. Hasil (daftar path file) tersimpan di field `result` job.
 
 ## Milestone
 
@@ -35,5 +38,5 @@ Tipe job bawaan: `echo`, `sleep` (payload `{"ms":100}`).
 - [x] M2 Worker core: claim, ack, retry, dead letter
 - [x] M3 API: submit, status, list
 - [x] M4 Resilience: graceful shutdown, visibility timeout
-- [ ] M5 Handlers: echo, sleep, resize
+- [x] M5 Handlers: echo, sleep, resize
 - [ ] M6 Test: integration test end-to-end

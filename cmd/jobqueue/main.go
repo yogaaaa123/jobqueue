@@ -89,6 +89,7 @@ func runWorker(args []string) {
 	n := fs.Int("n", 4, "jumlah worker goroutine")
 	poll := fs.Duration("poll", 200*time.Millisecond, "interval poll saat antrian kosong")
 	vis := fs.Duration("visibility", 60*time.Second, "lease job running tanpa heartbeat")
+	outdir := fs.String("outdir", "out", "folder hasil handler resize")
 	fs.Parse(args)
 
 	st, err := store.Open(*dbPath)
@@ -103,6 +104,7 @@ func runWorker(args []string) {
 	p.Visibility = *vis
 	p.Register("echo", handlers.Echo)
 	p.Register("sleep", handlers.Sleep)
+	p.Register("resize", handlers.Resize(st, *outdir))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
