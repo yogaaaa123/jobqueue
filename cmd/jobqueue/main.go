@@ -42,7 +42,7 @@ func usage() {
 
 func runWorker(args []string) {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
-	dbPath := fs.String("db", "jobqueue.db", "path file bbolt")
+	dbPath := fs.String("db", "jobqueue.db", "path file SQLite")
 	n := fs.Int("n", 4, "jumlah worker goroutine")
 	poll := fs.Duration("poll", 200*time.Millisecond, "interval poll saat antrian kosong")
 	fs.Parse(args)
