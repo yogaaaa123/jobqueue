@@ -39,4 +39,31 @@ Tipe job bawaan:
 - [x] M3 API: submit, status, list
 - [x] M4 Resilience: graceful shutdown, visibility timeout
 - [x] M5 Handlers: echo, sleep, resize
-- [ ] M6 Test: integration test end-to-end
+- [x] M6 Test: integration test end-to-end
+
+## Arsitektur
+
+```mermaid
+flowchart LR
+    C[Client] -->|POST /jobs| A[API - serve]
+    A -->|CRUD + claim| DB[(SQLite WAL)]
+    W[Worker - proses terpisah] -->|claim / heartbeat / ack| DB
+    W --> H[Handler: echo · sleep · resize]
+    H -->|result: path file| DB
+    C -->|GET /jobs/id| A
+```
+
+Dua proses (bukan dua goroutine): `serve` dan `worker` buka file SQLite yang sama. Job punya lease (`visibility`, default 60s) yang diperpanjang heartbeat; worker crash → lease lewat → proses lain reclaim. Delivery at-least-once, handler wajib idempotent.
+
+## Development
+
+```sh
+go test ./...          # unit + integration test end-to-end
+go test -race ./...    # dengan race detector
+./scripts/smoke_m3.sh   # E2E: serve + worker 2 proses, curl sampai job done
+./scripts/e2e_resize.sh # E2E: resize via API, verifikasi file + result
+```
+
+## Referensi
+
+Job adalah state machine: `pending → running → done` (sukses), `pending → running → pending` (retry dengan backoff 2^n detik, cap 5 menit), atau `→ dead` (habis `max_attempts` / lease expired di percobaan terakhir).
