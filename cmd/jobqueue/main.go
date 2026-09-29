@@ -47,7 +47,7 @@ func usage() {
 
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	dbPath := fs.String("db", "jobqueue.db", "path file bbolt")
+	dbPath := fs.String("db", "jobqueue.db", "path file SQLite")
 	addr := fs.String("addr", ":8080", "alamat listen")
 	fs.Parse(args)
 
