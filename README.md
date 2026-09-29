@@ -20,8 +20,8 @@ go run ./cmd/jobqueue worker   # worker pool
 
 ## Milestone
 
-- [ ] M1 Store: bbolt wrapper, job CRUD, antrian FIFO
-- [ ] M2 Worker core: claim, ack, retry, dead letter
+- [x] M1 Store: bbolt wrapper, job CRUD, antrian FIFO
+- [x] M2 Worker core: claim, ack, retry, dead letter
 - [ ] M3 API: submit, status, list
 - [ ] M4 Resilience: graceful shutdown, visibility timeout
 - [ ] M5 Handlers: echo, sleep, resize
