@@ -34,7 +34,7 @@ const (
 )
 
 // jobCols: urutan kolom yang cocok dengan scanJob.
-const jobCols = `id, type, payload, status, attempts, max_attempts, run_at, created_at, updated_at, last_error`
+const jobCols = `id, type, payload, status, attempts, max_attempts, run_at, created_at, updated_at, last_error, result`
 
 // Job adalah unit kerja di antrian.
 type Job struct {
@@ -48,6 +48,7 @@ type Job struct {
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 	LastError   string          `json:"last_error,omitempty"`
+	Result      string          `json:"result,omitempty"` // hasil handler (JSON string), diisi handler lewat SaveResult
 }
 
 // Store adalah wrapper SQLite untuk job + antrian.
@@ -109,12 +110,15 @@ func initSchema(db *sql.DB) error {
 			return err
 		}
 	}
-	// Migrasi: lease_until buat visibility timeout. DB lama belum punya kolom
-	// ini; DB baru kena "duplicate column" (diabaikan).
-	if _, err := db.ExecContext(ctx,
-		`ALTER TABLE jobs ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column name") {
-		return err
+	// Migrasi kolom baru (idempoten; "duplicate column" diabaikan).
+	for _, q := range []string{
+		`ALTER TABLE jobs ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0`, // M4: visibility timeout
+		`ALTER TABLE jobs ADD COLUMN result TEXT NOT NULL DEFAULT ''`,        // M5: hasil handler
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
 	}
 	return nil
 }
@@ -272,6 +276,13 @@ func (s *Store) Reclaim(ctx context.Context, now time.Time) (int64, error) {
 	return res.RowsAffected()
 }
 
+// SaveResult menyimpan hasil handler (mis. daftar path file hasil resize).
+func (s *Store) SaveResult(ctx context.Context, id, result string) error {
+	return s.execOne(ctx, `
+		UPDATE jobs SET result = ?, updated_at = ? WHERE id = ?`,
+		result, time.Now().UnixNano(), id)
+}
+
 // execOne: UPDATE yang wajih kena 1 baris, else ErrNotFound.
 func (s *Store) execOne(ctx context.Context, query string, args ...any) error {
 	res, err := s.db.ExecContext(ctx, query, args...)
@@ -296,7 +307,7 @@ func scanJob(scan func(dest ...any) error) (*Job, error) {
 		runAt, cre, upd int64
 	)
 	err := scan(&j.ID, &j.Type, &payload, &j.Status, &j.Attempts, &j.MaxAttempts,
-		&runAt, &cre, &upd, &j.LastError)
+		&runAt, &cre, &upd, &j.LastError, &j.Result)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
