@@ -127,3 +127,71 @@ Detail `resize`:
 - `format`: `jpeg` \| `png`; kosong = ikut sumber (gif → jpeg)
 - Sumber maks 100 megapiksel (anti decompression bomb)
 - Hasil (daftar path file) tersimpan sebagai JSON array di `result`
+
+## Cara kerja
+
+### Alur satu job
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: POST /jobs
+    pending --> running: worker claim (lease 60s)
+    running --> done: handler sukses
+    running --> pending: gagal, retry + backoff
+    running --> pending: worker crash → lease lewat, reclaim
+    pending --> dead: attempts habis / lease habis
+    done --> [*]
+    dead --> [*]
+```
+
+- **Retry**: handler error → job kembali `pending` dengan jeda `2^n` detik (2s, 4s, 8s... cap 5 menit), sampai `max_attempts` (default 3) habis → `dead` (dead letter, cek `last_error`).
+- **Crash safety**: setiap claim punya lease (`-visibility`, default 60s) yang diperpanjang heartbeat selama handler jalan. Worker mati → lease lewat → worker manapun `reclaim` job itu jadi `pending` lagi. Kalau attempts sudah habis saat lease mati → langsung `dead`.
+- **At-least-once**: job bisa terproses dua kali pada kasus ekstrem (mis. handler lebih lambat dari lease) → tulis handler idempotent.
+- **Shutdown**: `SIGINT`/`SIGTERM` → API berhenti terima koneksi baru (5s), worker selesaikan job in-flight dulu.
+
+### Arsitektur
+
+```mermaid
+flowchart LR
+    C[Client] -->|POST /jobs| A[API - serve]
+    A -->|CRUD + claim| DB[(SQLite WAL)]
+    W[Worker - proses terpisah] -->|claim / heartbeat / ack| DB
+    W --> H[Handler: echo · sleep · resize]
+    H -->|result: path file| DB
+    C -->|GET /jobs/id| A
+```
+
+Dua proses terpisah (bukan dua goroutine) berbagi satu file SQLite WAL — writer terserialisasi + `busy_timeout`, jadi `serve` bisa jalan di mesin lain asal file DB-nya dibagi. Worker mengambil job lewat `UPDATE ... RETURNING` atomik: tidak ada job yang dobel diambil.
+
+### Struktur project
+
+```
+cmd/jobqueue/         CLI: subcommand serve & worker
+internal/store/       SQLite: job CRUD, claim, lease/heartbeat, reclaim
+internal/worker/      pool goroutine, retry backoff, dead letter, panic recover
+internal/api/         HTTP API (net/http, routing Go 1.22)
+internal/handlers/    handler bawaan: echo, sleep, resize
+integration_test.go   test E2E lewat HTTP beneran
+scripts/              smoke test & E2E shell
+```
+
+## Development
+
+```sh
+go test ./...           # unit + integration test end-to-end
+go test -race ./...     # dengan race detector
+go vet ./...            # static check
+./scripts/smoke_m3.sh   # E2E: serve + worker 2 proses, curl sampai job done
+./scripts/e2e_resize.sh # E2E: resize via API, verifikasi file + result
+```
+
+Konvensi: PR per milestone, commit ikut Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`).
+
+## Milestone
+
+- [x] M1 Store: SQLite WAL, job CRUD, antrian FIFO
+- [x] M2 Worker core: claim, ack, retry, dead letter
+- [x] M3 API: submit, status, list
+- [x] M4 Resilience: graceful shutdown, visibility timeout
+- [x] M5 Handlers: echo, sleep, resize
+- [x] M6 Test: integration test end-to-end
