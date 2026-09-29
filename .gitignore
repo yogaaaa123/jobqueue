@@ -1,0 +1,16 @@
+# binaries
+/jobqueue
+/bin/
+
+# data
+*.db
+*.db.lock
+
+# go
+vendor/
+
+# editor/OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
