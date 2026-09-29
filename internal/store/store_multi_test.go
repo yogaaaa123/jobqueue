@@ -36,7 +36,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	if err := a.Create(ctx, j); err != nil {
 		t.Fatal(err)
 	}
-	got, err := b.Claim(ctx, time.Now())
+	got, err := b.Claim(ctx, time.Now(), time.Minute)
 	if err != nil {
 		t.Fatalf("claim dari koneksi kedua: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestConcurrentClaimExactlyOnce(t *testing.T) {
 			go func(st *Store) {
 				defer wg.Done()
 				for {
-					j, err := st.Claim(ctx, time.Now())
+					j, err := st.Claim(ctx, time.Now(), time.Minute)
 					if errors.Is(err, ErrEmpty) {
 						return
 					}
@@ -110,6 +110,32 @@ func TestConcurrentClaimExactlyOnce(t *testing.T) {
 	for id, c := range seen {
 		if c != 1 {
 			t.Fatalf("job %s di-claim %d kali, want 1", id, c)
+		}
+	}
+}
+
+// TestConcurrentOpenFreshDB: beberapa "proses" membuka file DB baru persis
+// bersamaan (reproduksi race serve+worker startup yang bikin SQLITE_BUSY).
+func TestConcurrentOpenFreshDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.db")
+	const n = 4
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			s, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			// Tiap koneksi harus bisa menulis setelah open.
+			err = s.Create(context.Background(), &Job{Type: "echo"})
+			s.Close()
+			errs <- err
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("open/create bersamaan: %v", err)
 		}
 	}
 }

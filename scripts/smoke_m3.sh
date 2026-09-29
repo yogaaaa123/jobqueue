@@ -11,13 +11,13 @@ rm -f "$DB" "$DB-wal" "$DB-shm"
 cleanup() {
   [[ -n "${SERVE_PID:-}" ]] && kill "$SERVE_PID" 2>/dev/null || true
   [[ -n "${WORKER_PID:-}" ]] && kill "$WORKER_PID" 2>/dev/null || true
-  rm -f "$BIN" "$DB" "$DB-wal" "$DB-shm"
+  rm -f "$BIN" "$DB" "$DB-wal" "$DB-shm" "$DB.serve.log" "$DB.worker.log"
 }
 trap cleanup EXIT
 
-"$BIN" serve -db "$DB" -addr "$ADDR" >/dev/null 2>&1 &
+"$BIN" serve -db "$DB" -addr "$ADDR" >"$DB.serve.log" 2>&1 </dev/null &
 SERVE_PID=$!
-"$BIN" worker -db "$DB" -n 2 -poll 50ms >/dev/null 2>&1 &
+"$BIN" worker -db "$DB" -n 2 -poll 50ms >"$DB.worker.log" 2>&1 </dev/null &
 WORKER_PID=$!
 
 # Tunggu serve siap (startup bisa >0.5s, jangan sleep tetap).
@@ -31,6 +31,8 @@ for _ in $(seq 1 30); do
 done
 if [[ "$READY" != 1 ]]; then
   echo "SMOKE GAGAL: serve tidak siap"
+  echo "=== serve.log ==="; cat "$DB.serve.log" 2>/dev/null
+  echo "=== worker.log ==="; cat "$DB.worker.log" 2>/dev/null
   exit 1
 fi
 
@@ -47,5 +49,10 @@ done
 echo "final status: $STATUS"
 echo "list: $(curl -sf "http://$ADDR/jobs?limit=5" | head -c 300)"
 
-[[ "$STATUS" == "done" ]] || { echo "SMOKE GAGAL"; exit 1; }
+if [[ "$STATUS" != "done" ]]; then
+  echo "SMOKE GAGAL"
+  echo "=== serve.log ==="; cat "$DB.serve.log" 2>/dev/null
+  echo "=== worker.log ==="; cat "$DB.worker.log" 2>/dev/null
+  exit 1
+fi
 echo "SMOKE OK"

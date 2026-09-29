@@ -10,7 +10,7 @@ import (
 // TestClaimEmpty: antrian kosong → ErrEmpty.
 func TestClaimEmpty(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Claim(context.Background(), time.Now()); !errors.Is(err, ErrEmpty) {
+	if _, err := s.Claim(context.Background(), time.Now(), time.Minute); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("want ErrEmpty, got %v", err)
 	}
 }
@@ -30,7 +30,7 @@ func TestClaimOrderAndSkipFuture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.Claim(ctx, now)
+	got, err := s.Claim(ctx, now, time.Minute)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -42,11 +42,11 @@ func TestClaimOrderAndSkipFuture(t *testing.T) {
 	}
 
 	// Sisa: job future belum jadwal → ErrEmpty.
-	if _, err := s.Claim(ctx, now); !errors.Is(err, ErrEmpty) {
+	if _, err := s.Claim(ctx, now, time.Minute); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("want ErrEmpty, got %v", err)
 	}
 	// Setelah jadwalnya tiba, baru bisa di-claim.
-	if _, err := s.Claim(ctx, now.Add(2*time.Hour)); err != nil {
+	if _, err := s.Claim(ctx, now.Add(2*time.Hour), time.Minute); err != nil {
 		t.Fatalf("claim future setelah jadwal: %v", err)
 	}
 }
@@ -60,7 +60,7 @@ func TestCompleteRequeueDead(t *testing.T) {
 	// Complete → tidak bisa di-claim lagi.
 	j1 := &Job{Type: "echo"}
 	s.Create(ctx, j1)
-	c, err := s.Claim(ctx, time.Now().UTC())
+	c, err := s.Claim(ctx, time.Now().UTC(), time.Minute)
 	if err != nil {
 		t.Fatalf("claim j1: %v", err)
 	}
@@ -71,14 +71,14 @@ func TestCompleteRequeueDead(t *testing.T) {
 	if got.Status != StatusDone || got.LastError != "" {
 		t.Fatalf("complete: %+v", got)
 	}
-	if _, err := s.Claim(ctx, now.Add(time.Minute)); !errors.Is(err, ErrEmpty) {
+	if _, err := s.Claim(ctx, now.Add(time.Minute), time.Minute); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("job done tidak boleh di-claim lagi, got %v", err)
 	}
 
 	// Requeue → pending lagi, bisa di-claim sesuai run_at.
 	j2 := &Job{Type: "echo"}
 	s.Create(ctx, j2)
-	c2, err := s.Claim(ctx, time.Now().UTC())
+	c2, err := s.Claim(ctx, time.Now().UTC(), time.Minute)
 	if err != nil {
 		t.Fatalf("claim j2: %v", err)
 	}
@@ -91,10 +91,10 @@ func TestCompleteRequeueDead(t *testing.T) {
 	if got.Status != StatusPending || got.LastError != "gagal sementara" {
 		t.Fatalf("requeue: %+v", got)
 	}
-	if _, err := s.Claim(ctx, time.Now().UTC()); !errors.Is(err, ErrEmpty) {
+	if _, err := s.Claim(ctx, time.Now().UTC(), time.Minute); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("belum jadwal, got %v", err)
 	}
-	reclaimed, err := s.Claim(ctx, time.Now().UTC().Add(2*time.Minute))
+	reclaimed, err := s.Claim(ctx, time.Now().UTC().Add(2*time.Minute), time.Minute)
 	if err != nil {
 		t.Fatalf("reclaim: %v", err)
 	}

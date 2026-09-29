@@ -88,6 +88,7 @@ func runWorker(args []string) {
 	dbPath := fs.String("db", "jobqueue.db", "path file SQLite")
 	n := fs.Int("n", 4, "jumlah worker goroutine")
 	poll := fs.Duration("poll", 200*time.Millisecond, "interval poll saat antrian kosong")
+	vis := fs.Duration("visibility", 60*time.Second, "lease job running tanpa heartbeat")
 	fs.Parse(args)
 
 	st, err := store.Open(*dbPath)
@@ -99,13 +100,14 @@ func runWorker(args []string) {
 
 	p := worker.New(st, *n)
 	p.PollEvery = *poll
+	p.Visibility = *vis
 	p.Register("echo", handlers.Echo)
 	p.Register("sleep", handlers.Sleep)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("worker mulai", "n", *n, "db", *dbPath, "poll", *poll)
+	slog.Info("worker mulai", "n", *n, "db", *dbPath, "poll", *poll, "visibility", *vis)
 	if err := p.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("worker berhenti", "err", err)
 		os.Exit(1)
