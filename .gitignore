@@ -1,5 +1,6 @@
 # binaries
 /jobqueue
+/scripts/jobqueue
 /bin/
 
 # data
