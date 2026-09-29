@@ -6,7 +6,6 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -70,18 +69,5 @@ func TestListFilterByStatus(t *testing.T) {
 	done, _ := s.List(ctx, StatusDone, 10)
 	if len(done) != 1 || done[0].Status != StatusDone {
 		t.Fatalf("filter status gagal: %+v", done)
-	}
-}
-
-// TestPendingKeyOrder: antrian harus terurut run_at (FIFO by waktu eksekusi).
-func TestPendingKeyOrder(t *testing.T) {
-	base := time.Now()
-	mk := func(offset time.Duration, id string) []byte {
-		j := &Job{ID: id, RunAt: base.Add(offset)}
-		return pendingKey(j)
-	}
-	k1, k2 := mk(time.Second, "b"), mk(0, "a")
-	if string(k1) <= string(k2) {
-		t.Fatal("run_at lebih besar harus sort setelah")
 	}
 }

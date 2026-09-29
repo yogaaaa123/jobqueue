@@ -1,10 +1,12 @@
-// Package store menyimpan job di bbolt: bucket "jobs" (id → JSON)
-// dan bucket "pending" (run_at||id → id) sebagai antrian FIFO by run_at.
+// Package store menyimpan job di SQLite (WAL): API dan worker boleh buka
+// file DB yang sama dari proses berbeda (bbolt tidak bisa, lock eksklusif).
+// Antrian = baris status 'pending' terurut run_at, id.
 package store
 
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -12,7 +14,7 @@ import (
 	"fmt"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
+	_ "modernc.org/sqlite" // pure Go, tanpa CGO; driver name "sqlite"
 )
 
 // ErrNotFound dipakai saat job dengan id tidak ada.
@@ -30,10 +32,8 @@ const (
 	StatusDead    = "dead"
 )
 
-var (
-	bucketJobs    = []byte("jobs")
-	bucketPending = []byte("pending")
-)
+// jobCols: urutan kolom yang cocok dengan scanJob.
+const jobCols = `id, type, payload, status, attempts, max_attempts, run_at, created_at, updated_at, last_error`
 
 // Job adalah unit kerja di antrian.
 type Job struct {
@@ -49,27 +49,39 @@ type Job struct {
 	LastError   string          `json:"last_error,omitempty"`
 }
 
-// Store adalah wrapper bbolt untuk job + antrian pending.
+// Store adalah wrapper SQLite untuk job + antrian.
 type Store struct {
-	db *bolt.DB
+	db *sql.DB
 }
 
-// Open membuka (atau membuat) file bbolt di path.
+// Open membuka (atau membuat) file SQLite di path.
+// WAL + busy_timeout supaya banyak proses/proseser aman berbagi satu file.
 func Open(path string) (*Store, error) {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open bbolt: %w", err)
+		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	err = db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(bucketJobs); err != nil {
-			return err
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS jobs (
+			id TEXT PRIMARY KEY,
+			type TEXT NOT NULL,
+			payload BLOB,
+			status TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL,
+			run_at INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			last_error TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, run_at)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.ExecContext(context.Background(), q); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("init schema: %w", err)
 		}
-		_, err := tx.CreateBucketIfNotExists(bucketPending)
-		return err
-	})
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("init buckets: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -99,123 +111,79 @@ func (s *Store) Create(ctx context.Context, j *Job) error {
 	j.CreatedAt = now
 	j.UpdatedAt = now
 
-	return s.db.Update(func(tx *bolt.Tx) error {
-		raw, err := json.Marshal(j)
-		if err != nil {
-			return err
-		}
-		if err := tx.Bucket(bucketJobs).Put([]byte(j.ID), raw); err != nil {
-			return err
-		}
-		return tx.Bucket(bucketPending).Put(pendingKey(j), []byte(j.ID))
-	})
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO jobs (id, type, payload, status, attempts, max_attempts, run_at, created_at, updated_at, last_error)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, '')`,
+		j.ID, j.Type, []byte(j.Payload), j.Status, j.MaxAttempts,
+		j.RunAt.UnixNano(), j.CreatedAt.UnixNano(), j.UpdatedAt.UnixNano())
+	if err != nil {
+		return fmt.Errorf("insert job: %w", err)
+	}
+	return nil
 }
 
 // Get mengambil job berdasarkan id. Mengembalikan ErrNotFound jika tidak ada.
 func (s *Store) Get(ctx context.Context, id string) (*Job, error) {
-	var j Job
-	err := s.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketJobs).Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		return json.Unmarshal(raw, &j)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &j, nil
+	row := s.db.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id)
+	return scanJob(row.Scan)
 }
 
-// List mengembalikan hingga limit job (urutan id, ≈ waktubuat), filter status opsional.
+// List mengembalikan hingga limit job (terurut run_at), filter status opsional.
 func (s *Store) List(ctx context.Context, status string, limit int) ([]*Job, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	var out []*Job
-	err := s.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(bucketJobs).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var j Job
-			if err := json.Unmarshal(v, &j); err != nil {
-				return err
-			}
-			if status != "" && j.Status != status {
-				continue
-			}
-			out = append(out, &j)
-			if len(out) >= limit {
-				return nil
-			}
-		}
-		return nil
-	})
-	return out, err
-}
+	query := `SELECT ` + jobCols + ` FROM jobs`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY run_at, id LIMIT ?`
+	args = append(args, limit)
 
-// Claim mengambil satu job siap (run_at <= now) secara atomik:
-// status → running, attempts++, dihapus dari pending.
-// Mengembalikan ErrEmpty bila tidak ada job siap.
-func (s *Store) Claim(ctx context.Context, now time.Time) (*Job, error) {
-	var claimed *Job
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		pc := tx.Bucket(bucketPending).Cursor()
-		jobs := tx.Bucket(bucketJobs)
-		for k, v := pc.First(); k != nil; k, v = pc.Next() {
-			// Key terurut run_at: ketemu yang belum jadwal → sisanya juga belum.
-			if binary.BigEndian.Uint64(k[:8]) > uint64(now.UnixNano()) {
-				return ErrEmpty
-			}
-			id := string(v)
-			raw := jobs.Get([]byte(id))
-			if raw == nil {
-				if err := pc.Delete(); err != nil {
-					return err
-				}
-				continue
-			}
-			var j Job
-			if err := json.Unmarshal(raw, &j); err != nil {
-				return err
-			}
-			if j.Status != StatusPending {
-				// Bukan pending lagi → bersihkan entri queue yatim.
-				if err := pc.Delete(); err != nil {
-					return err
-				}
-				continue
-			}
-			j.Status = StatusRunning
-			j.Attempts++
-			j.UpdatedAt = time.Now().UTC()
-			newRaw, err := json.Marshal(&j)
-			if err != nil {
-				return err
-			}
-			if err := jobs.Put([]byte(id), newRaw); err != nil {
-				return err
-			}
-			if err := pc.Delete(); err != nil {
-				return err
-			}
-			claimed = &j
-			return nil
-		}
-		return ErrEmpty
-	})
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return claimed, nil
+	defer rows.Close()
+	var out []*Job
+	for rows.Next() {
+		j, err := scanJob(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// Claim mengambil satu job siap (status pending, run_at <= now) secara atomik:
+// status → running, attempts++. Satu statement UPDATE...RETURNING = atomic.
+func (s *Store) Claim(ctx context.Context, now time.Time) (*Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs
+		SET status = ?, attempts = attempts + 1, updated_at = ?
+		WHERE id = (
+			SELECT id FROM jobs
+			WHERE status = ? AND run_at <= ?
+			ORDER BY run_at, id
+			LIMIT 1
+		)
+		RETURNING `+jobCols,
+		StatusRunning, now.UnixNano(), StatusPending, now.UnixNano())
+	j, err := scanJob(row.Scan)
+	if errors.Is(err, ErrNotFound) {
+		return nil, ErrEmpty
+	}
+	return j, err
 }
 
 // Complete menandai job selesai (done).
 func (s *Store) Complete(ctx context.Context, id string) error {
-	return s.updateJob(id, func(j *Job) error {
-		j.Status = StatusDone
-		j.LastError = ""
-		return nil
-	})
+	return s.execOne(ctx, `
+		UPDATE jobs SET status = ?, last_error = '', updated_at = ? WHERE id = ?`,
+		StatusDone, time.Now().UnixNano(), id)
 }
 
 // Requeue mengembalikan job ke antrian dengan run_at baru (retry/backoff).
@@ -223,50 +191,60 @@ func (s *Store) Requeue(ctx context.Context, j *Job) error {
 	if j.RunAt.IsZero() {
 		j.RunAt = time.Now().UTC()
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		j.Status = StatusPending
-		j.UpdatedAt = time.Now().UTC()
-		raw, err := json.Marshal(j)
-		if err != nil {
-			return err
-		}
-		if err := tx.Bucket(bucketJobs).Put([]byte(j.ID), raw); err != nil {
-			return err
-		}
-		return tx.Bucket(bucketPending).Put(pendingKey(j), []byte(j.ID))
-	})
+	now := time.Now().UTC()
+	if err := s.execOne(ctx, `
+		UPDATE jobs SET status = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+		StatusPending, j.RunAt.UnixNano(), j.LastError, now.UnixNano(), j.ID); err != nil {
+		return err
+	}
+	j.Status = StatusPending
+	j.UpdatedAt = now
+	return nil
 }
 
 // MarkDead menandai job gagal permanen (habis max_attempts).
 func (s *Store) MarkDead(ctx context.Context, id, lastError string) error {
-	return s.updateJob(id, func(j *Job) error {
-		j.Status = StatusDead
-		j.LastError = lastError
-		return nil
-	})
+	return s.execOne(ctx, `
+		UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+		StatusDead, lastError, time.Now().UnixNano(), id)
 }
 
-// updateJob mutasi in-place satu job dalam satu transaksi.
-func (s *Store) updateJob(id string, fn func(*Job) error) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		raw := tx.Bucket(bucketJobs).Get([]byte(id))
-		if raw == nil {
-			return ErrNotFound
-		}
-		var j Job
-		if err := json.Unmarshal(raw, &j); err != nil {
-			return err
-		}
-		if err := fn(&j); err != nil {
-			return err
-		}
-		j.UpdatedAt = time.Now().UTC()
-		newRaw, err := json.Marshal(&j)
-		if err != nil {
-			return err
-		}
-		return tx.Bucket(bucketJobs).Put([]byte(id), newRaw)
-	})
+// execOne: UPDATE yang wajih kena 1 baris, else ErrNotFound.
+func (s *Store) execOne(ctx context.Context, query string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// scanJob: kolom jobCols → Job (waktu unix nano → time.Time).
+func scanJob(scan func(dest ...any) error) (*Job, error) {
+	var (
+		j               Job
+		payload         []byte
+		runAt, cre, upd int64
+	)
+	err := scan(&j.ID, &j.Type, &payload, &j.Status, &j.Attempts, &j.MaxAttempts,
+		&runAt, &cre, &upd, &j.LastError)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	j.Payload = payload
+	j.RunAt = time.Unix(0, runAt).UTC()
+	j.CreatedAt = time.Unix(0, cre).UTC()
+	j.UpdatedAt = time.Unix(0, upd).UTC()
+	return &j, nil
 }
 
 // newID: 8 byte unix nano (big-endian, sortable) + 8 byte acak, hex 32 char.
@@ -275,12 +253,4 @@ func newID(now time.Time) string {
 	binary.BigEndian.PutUint64(b[:8], uint64(now.UnixNano()))
 	_, _ = rand.Read(b[8:])
 	return hex.EncodeToString(b[:])
-}
-
-// pendingKey: run_at big-endian supaya antrian terurut waktu eksekusi.
-func pendingKey(j *Job) []byte {
-	k := make([]byte, 8+len(j.ID))
-	binary.BigEndian.PutUint64(k[:8], uint64(j.RunAt.UnixNano()))
-	copy(k[8:], j.ID)
-	return k
 }

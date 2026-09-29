@@ -1,11 +1,11 @@
 # jobqueue
 
-Job queue + worker sederhana di Go. HTTP API buat submit tugas, worker pool buat proses, persist ke bbolt.
+Job queue + worker sederhana di Go. HTTP API buat submit tugas, worker pool buat proses, persist ke SQLite (WAL) — API & worker proses terpisah berbagi satu file DB.
 
 ## Fitur (target)
 
 - Submit job via `POST /jobs`, cek status via `GET /jobs/{id}`
-- Worker pool terpisah dari API (multi-process, satu file bbolt)
+- Worker pool terpisah dari API (multi-process, satu file SQLite WAL)
 - Retry dengan exponential backoff, dead letter setelah max attempts
 - Visibility timeout + heartbeat: worker crash → job di-reclaim
 - Graceful shutdown: selesaikan job in-flight sebelum keluar
@@ -20,7 +20,7 @@ go run ./cmd/jobqueue worker   # worker pool
 
 ## Milestone
 
-- [x] M1 Store: bbolt wrapper, job CRUD, antrian FIFO
+- [x] M1 Store: SQLite WAL, job CRUD, antrian FIFO
 - [x] M2 Worker core: claim, ack, retry, dead letter
 - [ ] M3 API: submit, status, list
 - [ ] M4 Resilience: graceful shutdown, visibility timeout
