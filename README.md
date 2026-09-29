@@ -82,3 +82,48 @@ curl -X POST localhost:8080/jobs \
 | | `-visibility` | `60s` | lease job running tanpa heartbeat |
 | | `-outdir` | `out` | folder hasil handler resize |
 
+## API
+
+| Method | Path | Keterangan |
+|---|---|---|
+| POST | `/jobs` | Submit job → **202** + job. Body: `type` (wajib), `payload`, `max_attempts` (0 = default atau 1..10), `run_at` (RFC3339, default sekarang) |
+| GET | `/jobs/{id}` | Detail job → **200**; tidak ada → **404** |
+| GET | `/jobs?status=pending&limit=50` | List job → **200** (limit 1..1000, default 100; kosong → `[]`) |
+| GET | `/healthz` | Health check → **200** `ok` |
+
+Error selalu berformat `{"error":"pesan"}` dengan status 400 (validasi), 404, atau 500. Body request dibatasi 1 MiB.
+
+### Contoh job
+
+```json
+{
+  "id": "18d9c3b20a4e5f6d7c8b9a0e1f2a3b4c",
+  "type": "resize",
+  "payload": {"src": "foto.jpg", "widths": [320, 640]},
+  "status": "done",
+  "attempts": 1,
+  "max_attempts": 3,
+  "run_at": "2026-09-29T10:00:00Z",
+  "created_at": "2026-09-29T10:00:00Z",
+  "updated_at": "2026-09-29T10:00:01Z",
+  "result": "[\"out/18d9...-320.jpg\",\"out/18d9...-640.jpg\"]"
+}
+```
+
+Field penting: `status` (`pending` → `running` → `done`/`dead`), `attempts` (sudah berapa kali diambil worker), `last_error` (alasan retry/akhir gagal), `result` (hasil handler, JSON string).
+
+### Tipe job bawaan
+
+| Tipe | Payload | Keterangan |
+|---|---|---|
+| `echo` | bebas | Log payload — buat uji koneksi |
+| `sleep` | `{"ms":100}` | Tidur N milidetik (default 100) — buat simulasi kerja |
+| `resize` | `{"src","widths","format?","outdir?"}` | Ukur ulang gambar, hasil di `out/{id}-{width}.{ext}` |
+
+Detail `resize`:
+
+- `src`: path file lokal **atau** `http(s)://` URL (timeout 30s, maks 20 MiB)
+- `widths`: 1..4096 px, maks 10 ukuran; tinggi ikut rasio
+- `format`: `jpeg` \| `png`; kosong = ikut sumber (gif → jpeg)
+- Sumber maks 100 megapiksel (anti decompression bomb)
+- Hasil (daftar path file) tersimpan sebagai JSON array di `result`
