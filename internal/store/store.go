@@ -18,6 +18,9 @@ import (
 // ErrNotFound dipakai saat job dengan id tidak ada.
 var ErrNotFound = errors.New("job not found")
 
+// ErrEmpty saat tidak ada job yang siap diambil (antrian kosong / semua belum jadwal).
+var ErrEmpty = errors.New("antrian kosong")
+
 // Status job.
 const (
 	StatusPending = "pending"
@@ -148,6 +151,122 @@ func (s *Store) List(ctx context.Context, status string, limit int) ([]*Job, err
 		return nil
 	})
 	return out, err
+}
+
+// Claim mengambil satu job siap (run_at <= now) secara atomik:
+// status → running, attempts++, dihapus dari pending.
+// Mengembalikan ErrEmpty bila tidak ada job siap.
+func (s *Store) Claim(ctx context.Context, now time.Time) (*Job, error) {
+	var claimed *Job
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		pc := tx.Bucket(bucketPending).Cursor()
+		jobs := tx.Bucket(bucketJobs)
+		for k, v := pc.First(); k != nil; k, v = pc.Next() {
+			// Key terurut run_at: ketemu yang belum jadwal → sisanya juga belum.
+			if binary.BigEndian.Uint64(k[:8]) > uint64(now.UnixNano()) {
+				return ErrEmpty
+			}
+			id := string(v)
+			raw := jobs.Get([]byte(id))
+			if raw == nil {
+				if err := pc.Delete(); err != nil {
+					return err
+				}
+				continue
+			}
+			var j Job
+			if err := json.Unmarshal(raw, &j); err != nil {
+				return err
+			}
+			if j.Status != StatusPending {
+				// Bukan pending lagi → bersihkan entri queue yatim.
+				if err := pc.Delete(); err != nil {
+					return err
+				}
+				continue
+			}
+			j.Status = StatusRunning
+			j.Attempts++
+			j.UpdatedAt = time.Now().UTC()
+			newRaw, err := json.Marshal(&j)
+			if err != nil {
+				return err
+			}
+			if err := jobs.Put([]byte(id), newRaw); err != nil {
+				return err
+			}
+			if err := pc.Delete(); err != nil {
+				return err
+			}
+			claimed = &j
+			return nil
+		}
+		return ErrEmpty
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
+// Complete menandai job selesai (done).
+func (s *Store) Complete(ctx context.Context, id string) error {
+	return s.updateJob(id, func(j *Job) error {
+		j.Status = StatusDone
+		j.LastError = ""
+		return nil
+	})
+}
+
+// Requeue mengembalikan job ke antrian dengan run_at baru (retry/backoff).
+func (s *Store) Requeue(ctx context.Context, j *Job) error {
+	if j.RunAt.IsZero() {
+		j.RunAt = time.Now().UTC()
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		j.Status = StatusPending
+		j.UpdatedAt = time.Now().UTC()
+		raw, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketJobs).Put([]byte(j.ID), raw); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketPending).Put(pendingKey(j), []byte(j.ID))
+	})
+}
+
+// MarkDead menandai job gagal permanen (habis max_attempts).
+func (s *Store) MarkDead(ctx context.Context, id, lastError string) error {
+	return s.updateJob(id, func(j *Job) error {
+		j.Status = StatusDead
+		j.LastError = lastError
+		return nil
+	})
+}
+
+// updateJob mutasi in-place satu job dalam satu transaksi.
+func (s *Store) updateJob(id string, fn func(*Job) error) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		raw := tx.Bucket(bucketJobs).Get([]byte(id))
+		if raw == nil {
+			return ErrNotFound
+		}
+		var j Job
+		if err := json.Unmarshal(raw, &j); err != nil {
+			return err
+		}
+		if err := fn(&j); err != nil {
+			return err
+		}
+		j.UpdatedAt = time.Now().UTC()
+		newRaw, err := json.Marshal(&j)
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(bucketJobs).Put([]byte(id), newRaw)
+	})
 }
 
 // newID: 8 byte unix nano (big-endian, sortable) + 8 byte acak, hex 32 char.
