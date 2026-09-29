@@ -34,6 +34,6 @@ Tipe job bawaan: `echo`, `sleep` (payload `{"ms":100}`).
 - [x] M1 Store: SQLite WAL, job CRUD, antrian FIFO
 - [x] M2 Worker core: claim, ack, retry, dead letter
 - [x] M3 API: submit, status, list
-- [ ] M4 Resilience: graceful shutdown, visibility timeout
+- [x] M4 Resilience: graceful shutdown, visibility timeout
 - [ ] M5 Handlers: echo, sleep, resize
 - [ ] M6 Test: integration test end-to-end

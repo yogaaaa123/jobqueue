@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure Go, tanpa CGO; driver name "sqlite"
@@ -57,11 +58,37 @@ type Store struct {
 // Open membuka (atau membuat) file SQLite di path.
 // WAL + busy_timeout supaya banyak proses/proseser aman berbagi satu file.
 func Open(path string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", path)
+	// Urutan pragmas penting: busy_timeout harus dulu, sebelum journal_mode(WAL)
+	// yang butuh lock — kalau sesudah, switch WAL jalan dengan timeout 0 dan
+	// langsung SQLITE_BUSY saat dua proses buka DB bersamaan.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// Init bisa kena SQLITE_BUSY saat banyak proses buka DB segar bersamaan
+	// (mis. serve + worker start bersamaan). Operasi idempoten → retry sampai
+	// lock lepas, error non-busy gagal cepat.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err = initSchema(db)
+		if err == nil {
+			break
+		}
+		busy := strings.Contains(err.Error(), "database is locked") ||
+			strings.Contains(err.Error(), "SQLITE_BUSY")
+		if !busy || time.Now().After(deadline) {
+			db.Close()
+			return nil, fmt.Errorf("init schema: %w", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return &Store{db: db}, nil
+}
+
+// initSchema: tabel + indeks + migrasi lease_until, semua idempoten.
+func initSchema(db *sql.DB) error {
+	ctx := context.Background()
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
 			id TEXT PRIMARY KEY,
@@ -78,12 +105,18 @@ func Open(path string) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(status, run_at)`,
 	}
 	for _, q := range stmts {
-		if _, err := db.ExecContext(context.Background(), q); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("init schema: %w", err)
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			return err
 		}
 	}
-	return &Store{db: db}, nil
+	// Migrasi: lease_until buat visibility timeout. DB lama belum punya kolom
+	// ini; DB baru kena "duplicate column" (diabaikan).
+	if _, err := db.ExecContext(ctx,
+		`ALTER TABLE jobs ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 // Close menutup database.
@@ -159,11 +192,12 @@ func (s *Store) List(ctx context.Context, status string, limit int) ([]*Job, err
 }
 
 // Claim mengambil satu job siap (status pending, run_at <= now) secara atomik:
-// status → running, attempts++. Satu statement UPDATE...RETURNING = atomic.
-func (s *Store) Claim(ctx context.Context, now time.Time) (*Job, error) {
+// status → running, attempts++, lease_until = now+visibility. Worker wajib
+// Heartbeat selama proses; lease lewat → job bisa di-Reclaim proses lain.
+func (s *Store) Claim(ctx context.Context, now time.Time, visibility time.Duration) (*Job, error) {
 	row := s.db.QueryRowContext(ctx, `
 		UPDATE jobs
-		SET status = ?, attempts = attempts + 1, updated_at = ?
+		SET status = ?, attempts = attempts + 1, lease_until = ?, updated_at = ?
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE status = ? AND run_at <= ?
@@ -171,7 +205,7 @@ func (s *Store) Claim(ctx context.Context, now time.Time) (*Job, error) {
 			LIMIT 1
 		)
 		RETURNING `+jobCols,
-		StatusRunning, now.UnixNano(), StatusPending, now.UnixNano())
+		StatusRunning, now.Add(visibility).UnixNano(), now.UnixNano(), StatusPending, now.UnixNano())
 	j, err := scanJob(row.Scan)
 	if errors.Is(err, ErrNotFound) {
 		return nil, ErrEmpty
@@ -207,6 +241,35 @@ func (s *Store) MarkDead(ctx context.Context, id, lastError string) error {
 	return s.execOne(ctx, `
 		UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
 		StatusDead, lastError, time.Now().UnixNano(), id)
+}
+
+// Heartbeat memperpanjang lease job running sampai until. No-op (ErrNotFound)
+// bila job sudah tidak running (mis. sudah di-reclaim).
+func (s *Store) Heartbeat(ctx context.Context, id string, until time.Time) error {
+	return s.execOne(ctx, `
+		UPDATE jobs SET lease_until = ? WHERE id = ? AND status = ?`,
+		until.UnixNano(), id, StatusRunning)
+}
+
+// Reclaim mengembalikan job running yang lease-nya lewat (worker mati): → pending
+// (run_at = now). Kalau attempts sudah >= max_attempts → dead, bukan requeue.
+// Mengembalikan jumlah job yang kena.
+func (s *Store) Reclaim(ctx context.Context, now time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET
+			status = CASE WHEN attempts >= max_attempts THEN ? ELSE ? END,
+			run_at = CASE WHEN attempts >= max_attempts THEN run_at ELSE ? END,
+			last_error = CASE WHEN attempts >= max_attempts THEN ? ELSE last_error END,
+			lease_until = 0,
+			updated_at = ?
+		WHERE status = ? AND lease_until > 0 AND lease_until <= ?`,
+		StatusDead, StatusPending, now.UnixNano(),
+		"lease expired (worker berhenti)", now.UnixNano(),
+		StatusRunning, now.UnixNano())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // execOne: UPDATE yang wajih kena 1 baris, else ErrNotFound.

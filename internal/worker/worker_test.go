@@ -146,3 +146,101 @@ func TestBackoff(t *testing.T) {
 		}
 	}
 }
+
+// TestHeartbeatKeepsLongJobLeased: handler lebih lama dari visibility →
+// heartbeat menahan lease, job tidak di-reclaim (attempts tetap 1).
+func TestHeartbeatKeepsLongJobLeased(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := New(s, 1)
+	p.PollEvery = 5 * time.Millisecond
+	p.Visibility = 100 * time.Millisecond // lease pendek
+	p.ReclaimEvery = 20 * time.Millisecond
+	p.Register("slow", func(ctx context.Context, j *store.Job) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(400 * time.Millisecond): // 4× lease
+			return nil
+		}
+	})
+
+	j := &store.Job{Type: "slow"}
+	if err := s.Create(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	go p.Run(runCtx)
+
+	got := waitStatus(t, s, j.ID, store.StatusDone)
+	cancel()
+	if got.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (heartbeat harus mencegah reclaim)", got.Attempts)
+	}
+}
+
+// TestReclaimStuckRunningJob: job tertinggal di running (worker lama crash,
+// lease keburu lewat) → reclaimer pool mengambil dan worker proses sampai done.
+func TestReclaimStuckRunningJob(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// "Crash": claim langsung tanpa heartbeat, lease 30ms.
+	j := &store.Job{Type: "echo"}
+	if err := s.Create(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(ctx, time.Now(), 30*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(s, 1)
+	p.PollEvery = 5 * time.Millisecond
+	p.Visibility = 50 * time.Millisecond
+	p.ReclaimEvery = 20 * time.Millisecond
+	p.Register("echo", func(ctx context.Context, j *store.Job) error { return nil })
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	go p.Run(runCtx)
+
+	got := waitStatus(t, s, j.ID, store.StatusDone)
+	cancel()
+	if got.Attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 (1 crash + 1 sukses)", got.Attempts)
+	}
+}
+
+// TestHandlerPanicRecovered: panic di handler → dianggap error biasa
+// (retry → dead), proses worker tidak mati dan tetap proses job lain.
+func TestHandlerPanicRecovered(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := New(s, 1)
+	p.PollEvery = 5 * time.Millisecond
+	p.Backoff = func(int) time.Duration { return 5 * time.Millisecond }
+	p.Register("panik", func(ctx context.Context, j *store.Job) error {
+		panic("handler nakal")
+	})
+	p.Register("echo", func(ctx context.Context, j *store.Job) error { return nil })
+
+	bad := &store.Job{Type: "panik", MaxAttempts: 2}
+	good := &store.Job{Type: "echo"}
+	if err := s.Create(ctx, bad); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create(ctx, good); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	go p.Run(runCtx)
+
+	dead := waitStatus(t, s, bad.ID, store.StatusDead)
+	if dead.Attempts != 2 {
+		t.Fatalf("panic job attempts = %d, want 2", dead.Attempts)
+	}
+	waitStatus(t, s, good.ID, store.StatusDone) // worker masih hidup
+	cancel()
+}
