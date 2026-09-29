@@ -1,69 +1,84 @@
 # jobqueue
 
-Job queue + worker sederhana di Go. HTTP API buat submit tugas, worker pool buat proses, persist ke SQLite (WAL) — API & worker proses terpisah berbagi satu file DB.
+Job queue sederhana di Go: **HTTP API menerima tugas, worker pool memprosesnya di proses terpisah, state disimpan di SQLite.** Tugas tidak hilang walau proses crash dan request user tidak pernah menunggu kerja berat.
+
+## Apa ini, buat apa?
+
+Contoh nyata: endpoint upload foto — server harus resize ke 5 ukuran. Kalau dikerjakan langsung di request, user menunggu lama; kalau server mati di tengah jalan, pekerjaan hilang. `jobqueue` memecahnya:
+
+- **`jobqueue serve`** (API) hanya menerima tugas dan langsung membalas `202 accepted` — request tetap cepat.
+- **`jobqueue worker`** mengambil tugas dari antrian dan memprosesnya — boleh banyak proses, boleh ditambah worker-nya.
+- **SQLite (WAL)** menyimpan antrian dan status — proses crash tinggal dinyalakan lagi, tugas dilanjut (retry / reclaim otomatis).
+
+Cocok untuk:
+
+- proses upload: resize gambar, generate thumbnail
+- kirim email / notifikasi massal tanpa memperlambat request
+- generate laporan periodik
+- scraping atau tugas rutin yang butuh retry otomatis
+
+Kurang cocok: butuh skala multi-node (pakai queue berbasis Redis/Postgres seperti River atau Faktory), atau tugas ringan sekali jalan (goroutine biasa sudah cukup).
 
 ## Fitur
 
 - Submit job via `POST /jobs`, cek status via `GET /jobs/{id}`
 - Worker pool terpisah dari API (multi-process, satu file SQLite WAL)
-- Retry dengan exponential backoff, dead letter setelah max attempts
-- Visibility timeout + heartbeat: worker crash → job di-reclaim
+- Retry dengan exponential backoff (2^n detik, cap 5 menit), dead letter setelah max attempts
+- Visibility timeout + heartbeat: worker crash → job di-reclaim proses lain
 - Graceful shutdown: selesaikan job in-flight sebelum keluar
 - Delivery at-least-once → handler wajib idempotent
+- Handler bawaan: `echo`, `sleep`, `resize` (dengan hasil di `result`)
 
-## Cara jalan
+## Quick start
 
-```sh
-go run ./cmd/jobqueue serve    # API di :8080
-go run ./cmd/jobqueue worker   # worker pool
-```
-
-## API
-
-| Method | Path | Keterangan |
-|---|---|---|
-| POST | `/jobs` | Body `{"type":"echo","payload":{},"max_attempts":3,"run_at":"RFC3339"}` → 202 + job |
-| GET | `/jobs/{id}` | 200 job, 404 jika tidak ada |
-| GET | `/jobs?status=pending&limit=50` | List job (limit 1..1000, default 100) |
-| GET | `/healthz` | 200 `ok` |
-
-Tipe job bawaan:
-- `echo` — log payload.
-- `sleep` — tidur sesuai `{"ms":100}`.
-- `resize` — ukur ulang gambar. Payload `{"src":"path/atau/url","widths":[320,640],"format":"jpeg|png","outdir":"out"}` (`format` kosong = ikut sumber; gif → jpeg). Batas: 20 MiB, 100 megapiksel, maks 10 width. Hasil (daftar path file) tersimpan di field `result` job.
-
-## Milestone
-
-- [x] M1 Store: SQLite WAL, job CRUD, antrian FIFO
-- [x] M2 Worker core: claim, ack, retry, dead letter
-- [x] M3 API: submit, status, list
-- [x] M4 Resilience: graceful shutdown, visibility timeout
-- [x] M5 Handlers: echo, sleep, resize
-- [x] M6 Test: integration test end-to-end
-
-## Arsitektur
-
-```mermaid
-flowchart LR
-    C[Client] -->|POST /jobs| A[API - serve]
-    A -->|CRUD + claim| DB[(SQLite WAL)]
-    W[Worker - proses terpisah] -->|claim / heartbeat / ack| DB
-    W --> H[Handler: echo · sleep · resize]
-    H -->|result: path file| DB
-    C -->|GET /jobs/id| A
-```
-
-Dua proses (bukan dua goroutine): `serve` dan `worker` buka file SQLite yang sama. Job punya lease (`visibility`, default 60s) yang diperpanjang heartbeat; worker crash → lease lewat → proses lain reclaim. Delivery at-least-once, handler wajib idempotent.
-
-## Development
+Prasyarat: [Go](https://go.dev/dl/) 1.22+ (routing `GET /jobs/{id}` pakai stdlib Go 1.22).
 
 ```sh
-go test ./...          # unit + integration test end-to-end
-go test -race ./...    # dengan race detector
-./scripts/smoke_m3.sh   # E2E: serve + worker 2 proses, curl sampai job done
-./scripts/e2e_resize.sh # E2E: resize via API, verifikasi file + result
+git clone https://github.com/yogaaaa123/jobqueue.git
+cd jobqueue
 ```
 
-## Referensi
+Terminal 1 — API:
 
-Job adalah state machine: `pending → running → done` (sukses), `pending → running → pending` (retry dengan backoff 2^n detik, cap 5 menit), atau `→ dead` (habis `max_attempts` / lease expired di percobaan terakhir).
+```sh
+go run ./cmd/jobqueue serve      # http://localhost:8080, DB: jobqueue.db
+```
+
+Terminal 2 — worker (file `-db` harus sama dengan serve):
+
+```sh
+go run ./cmd/jobqueue worker
+```
+
+Terminal 3 — submit tugas pertama:
+
+```sh
+curl -X POST localhost:8080/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"echo","payload":{"msg":"halo"}}'
+# → 202 {"id":"18d9...","status":"pending",...}
+
+curl localhost:8080/jobs/18d9...        # poll sampai "status":"done"
+```
+
+Contoh nyata — resize gambar (`foto.jpg` ada di folder yang sama dengan worker):
+
+```sh
+curl -X POST localhost:8080/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"resize","payload":{"src":"foto.jpg","widths":[320,640,1280]}}'
+# hasil: out/<job-id>-320.jpg dst.; daftar path ada di field "result" job
+```
+
+### Flag CLI
+
+| Perintah | Flag | Default | Keterangan |
+|---|---|---|---|
+| `serve` | `-db` | `jobqueue.db` | file SQLite |
+| | `-addr` | `:8080` | alamat listen |
+| `worker` | `-db` | `jobqueue.db` | file SQLite (harus sama dengan serve) |
+| | `-n` | `4` | jumlah goroutine worker |
+| | `-poll` | `200ms` | interval poll saat antrian kosong |
+| | `-visibility` | `60s` | lease job running tanpa heartbeat |
+| | `-outdir` | `out` | folder hasil handler resize |
+
